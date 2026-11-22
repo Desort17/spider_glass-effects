@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ice Web – body-tracked glass effect</title>
+<style>
+  :root{--bg:#06090f;--panel:#0e1522;--line:#1e2c44;--ice:#7fdcff;--txt:#e8f6ff;--mut:#7f95b0}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  body{display:flex;flex-direction:column}
+  header{padding:10px 14px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+  header h1{font-size:16px;margin:0;letter-spacing:.3px;font-weight:600}
+  header h1 span{color:var(--ice)}
+  #status{font-size:12px;color:var(--mut);text-align:right}
+  #stage{flex:1;min-height:0;position:relative;display:flex;align-items:center;justify-content:center;padding:0 10px}
+  canvas{max-width:100%;max-height:100%;border-radius:14px;background:#000;box-shadow:0 0 40px rgba(80,200,255,.12)}
+  video{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+  #start{position:absolute;inset:0;margin:auto;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;text-align:center;padding:24px}
+  #start p{color:var(--mut);max-width:320px;font-size:14px;line-height:1.5;margin:0}
+  .panel{background:var(--panel);border-top:1px solid var(--line);padding:10px 12px calc(10px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:10px}
+  .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  button,.btn,select{background:#142039;color:var(--txt);border:1px solid var(--line);border-radius:10px;padding:10px 14px;font-size:14px;cursor:pointer}
+  button.primary{background:linear-gradient(135deg,#2aa7ff,#69e6ff);color:#02121f;font-weight:700;border:0}
+  button.rec{background:#3a1420;border-color:#6b2236}
+  button.rec.on{background:#e8344f;border-color:#e8344f}
+  button:active{transform:scale(.97)}
+  label.chk{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--mut)}
+  .sl{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--mut);flex:1;min-width:150px}
+  .sl input{flex:1;accent-color:#5fd4ff}
+  #result a{color:#02121f;background:var(--ice);padding:8px 12px;border-radius:10px;text-decoration:none;font-weight:700;font-size:14px}
+  input[type=file]{display:none}
+  .hide{display:none!important}
+</style>
+</head>
+<body>
+<header>
+  <h1>ICE <span>WEB</span> · body-tracked glass effect</h1>
+  <div id="status">Loading tracker…</div>
+</header>
+
+<div id="stage">
+  <canvas id="c" width="640" height="480"></canvas>
+  <video id="v" playsinline muted></video>
+  <div id="start">
+    <h2 style="margin:0">Become ice.</h2>
+    <p>Your body gets an icy, watery glass skin with a web that follows every move. Everything runs in your browser – no video is uploaded anywhere.</p>
+    <button class="primary" id="startCam">Start camera</button>
+    <button id="startUp">…or upload a video</button>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="row">
+    <button id="camBtn">Camera</button>
+    <button id="flipBtn">Flip</button>
+    <label class="btn" for="file">Upload video</label>
+    <input type="file" id="file" accept="video/*">
+    <button id="rec" class="rec">● Record</button>
+    <button id="snap">Photo</button>
+    <span id="result"></span>
+  </div>
+  <div class="row">
+    <label class="sl">Strength <input type="range" id="int" min="0" max="1" step="0.01" value="0.7"></label>
+    <select id="pal">
+      <option value="ice">Ice blue</option>
+      <option value="aqua">Aqua water</option>
+      <option value="frost">Frost violet</option>
+    </select>
+  </div>
+  <div class="row">
+    <label class="chk"><input type="checkbox" id="oGlass" checked> Glass skin</label>
+    <label class="chk"><input type="checkbox" id="oWeb" checked> Web</label>
+    <label class="chk"><input type="checkbox" id="oDrops" checked> Water drops</label>
+    <label class="chk"><input type="checkbox" id="oTrail" checked> Hand trails</label>
+  </div>
+</div>
+
+<script type="module">
+import {PoseLandmarker, FilesetResolver} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = id => document.getElementById(id);
+const cv = $('c'), ctx = cv.getContext('2d');
+const video = $('v');
+const tmp = document.createElement('canvas'), t = tmp.getContext('2d');
+const small = document.createElement('canvas'), sc = small.getContext('2d');
+const maskCv = document.createElement('canvas'), mctx = maskCv.getContext('2d');
+const mTmp = document.createElement('canvas'), mtc = mTmp.getContext('2d');
+
+const PAL = {
+  ice:   {a:'#d9f8ff', b:'#4cc9ff', c:'#ffffff'},
+  aqua:  {a:'#9dfff0', b:'#00b8c4', c:'#eafffb'},
+  frost: {a:'#e3d9ff', b:'#7a8cff', c:'#ffffff'}
+};
+const cfg = {pal:'ice', I:.7, glass:true, web:true, drops:true, trail:true};
+let mirror = true, facing = 'user', stream = null;
+let landmarker = null, lastTs = 0;
+let people = [], smooth = [], hasMask = false;
+let trails = [], drops = [];
+
+/* ---------- UI ---------- */
+const status = m => $('status').textContent = m;
+$('int').oninput = e => cfg.I = +e.target.value;
+$('pal').onchange = e => cfg.pal = e.target.value;
+$('oGlass').onchange = e => cfg.glass = e.target.checked;
+$('oWeb').onchange = e => cfg.web = e.target.checked;
+$('oDrops').onchange = e => cfg.drops = e.target.checked;
+$('oTrail').onchange = e => cfg.trail = e.target.checked;
+$('startCam').onclick = () => startCam(facing);
+$('camBtn').onclick = () => startCam(facing);
+$('flipBtn').onclick = () => startCam(facing === 'user' ? 'environment' : 'user');
+$('startUp').onclick = () => $('file').click();
+$('file').onchange = e => { const f = e.target.files[0]; if (f) loadFile(f); };
+$('rec').onclick = toggleRec;
+$('snap').onclick = () => cv.toBlob(b => download(b, 'ice-web.png'), 'image/png');
+
+/* ---------- Sources ---------- */
+function stopStream(){ if (stream){ stream.getTracks().forEach(t => t.stop()); stream = null; } }
+async function startCam(f){
+  facing = f;
+  try{
+    stopStream();
+    video.removeAttribute('src');
+    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:f, width:{ideal:1280}, height:{ideal:720}}, audio:false});
+    video.srcObject = stream; video.muted = true; video.loop = false;
+    mirror = (f === 'user');
+    await video.play();
+    $('start').classList.add('hide');
+    status(landmarker ? 'Tracking' : 'Loading tracker…');
+  }catch(err){
+    status('Camera blocked: ' + err.message);
+    alert('Camera could not start. Allow camera access and open this page over https (or localhost).');
+  }
+}
+async function loadFile(file){
+  stopStream();
+  video.srcObject = null;
+  video.src = URL.createObjectURL(file);
+  video.loop = true; mirror = false; video.muted = false;
+  try{ await video.play(); }catch(e){ video.muted = true; try{ await video.play(); }catch(_){} }
+  $('start').classList.add('hide');
+  status(landmarker ? 'Tracking' : 'Loading tracker…');
+}
+
+/* ---------- Tracker ---------- */
+(async () => {
+  try{
+    const fs = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    const model = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+    const make = delegate => PoseLandmarker.createFromOptions(fs, {
+      baseOptions:{modelAssetPath:model, delegate},
+      runningMode:'VIDEO', numPoses:2, outputSegmentationMasks:true,
+      minPoseDetectionConfidence:.5, minPosePresenceConfidence:.5, minTrackingConfidence:.5
+    });
+    try{ landmarker = await make('GPU'); }catch(e){ landmarker = await make('CPU'); }
+    status('Tracker ready');
+  }catch(e){ status('Tracker failed to load (check internet)'); }
+})();
+
+function onResult(res){
+  people = (res.landmarks || []).map((lm, i) => {
+    const prev = smooth[i];
+    const cur = lm.map((p, k) => {
+      const q = prev && prev[k];
+      return q ? {x:q.x+(p.x-q.x)*.55, y:q.y+(p.y-q.y)*.55, v:p.visibility ?? 1}
+               : {x:p.x, y:p.y, v:p.visibility ?? 1};
+    });
+    smooth[i] = cur; return cur;
+  });
+  smooth.length = people.length;
+  const ms = res.segmentationMasks || [];
+  hasMask = ms.length > 0;
+  if (hasMask){
+    const w = ms[0].width, h = ms[0].height;
+    if (maskCv.width !== w || maskCv.height !== h){ maskCv.width = mTmp.width = w; maskCv.height = mTmp.height = h; }
+    mctx.clearRect(0, 0, w, h);
+    for (const m of ms){
+      const arr = m.getAsFloat32Array();
+      const img = mtc.createImageData(w, h), d = img.data;
+      for (let i = 0; i < arr.length; i++){
+        let a = (arr[i] - .35) / .35; a = a < 0 ? 0 : a > 1 ? 1 : a;
+        const o = i * 4; d[o] = d[o+1] = d[o+2] = 255; d[o+3] = a * 255;
+      }
+      mtc.putImageData(img, 0, 0);
+      mctx.drawImage(mTmp, 0, 0);
+    }
+  }
+}
+
+/* ---------- Rendering ---------- */
+const pt = (p, W, H) => [(mirror ? 1 - p.x : p.x) * W, p.y * H];
+const BONES = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28],[27,31],[28,32],[15,19],[16,20],[0,11],[0,12]];
+const KEY = [0,7,8,11,12,13,14,15,16,23,24,25,26,27,28];
+
+function glow(P, w, a, fn){
+  ctx.beginPath(); fn();
+  ctx.strokeStyle = P.c; ctx.shadowColor = P.b; ctx.shadowBlur = 10;
+  ctx.lineWidth = w; ctx.globalAlpha = a; ctx.stroke();
+}
+
+function drawIce(W, H, P){
+  const I = cfg.I;
+  const sw = Math.max(16, W / 9 | 0), sh = Math.max(16, H / 9 | 0);
+  if (small.width !== sw || small.height !== sh){ small.width = sw; small.height = sh; }
+  sc.save(); if (mirror){ sc.translate(sw, 0); sc.scale(-1, 1); }
+  sc.drawImage(video, 0, 0, sw, sh); sc.restore();
+  if (tmp.width !== W || tmp.height !== H){ tmp.width = W; tmp.height = H; }
+  t.setTransform(1,0,0,1,0,0); t.globalAlpha = 1; t.globalCompositeOperation = 'source-over';
+  t.clearRect(0, 0, W, H);
+  t.imageSmoothingEnabled = true; t.imageSmoothingQuality = 'high';
+  t.drawImage(small, 0, 0, W, H);
+  const g = t.createLinearGradient(0, 0, W, H);
+  g.addColorStop(0, P.a); g.addColorStop(.5, P.b); g.addColorStop(1, P.a);
+  t.globalCompositeOperation = 'soft-light'; t.globalAlpha = .9; t.fillStyle = g; t.fillRect(0, 0, W, H);
+  t.globalCompositeOperation = 'screen'; t.globalAlpha = .22 + .25 * I; t.fillStyle = P.b; t.fillRect(0, 0, W, H);
+  // water ripples
+  const tm = performance.now() / 1000;
+  t.globalCompositeOperation = 'lighter'; t.globalAlpha = .09 + .1 * I; t.strokeStyle = P.c; t.lineWidth = 2;
+  for (let y = -20; y < H + 20; y += 22){
+    t.beginPath();
+    for (let x = 0; x <= W; x += 24){
+      const yy = y + Math.sin(x * .02 + tm * 1.6 + y * .05) * 6;
+      x ? t.lineTo(x, yy) : t.moveTo(x, yy);
+    }
+    t.stroke();
+  }
+  t.globalAlpha = 1;
+  t.globalCompositeOperation = 'destination-in';
+  t.save(); if (mirror){ t.translate(W, 0); t.scale(-1, 1); }
+  t.drawImage(maskCv, 0, 0, W, H); t.restore();
+  t.globalCompositeOperation = 'source-over';
+  ctx.save();
+  ctx.shadowColor = P.b; ctx.shadowBlur = 18 + 20 * I; ctx.globalAlpha = .55 + .4 * I;
+  ctx.drawImage(tmp, 0, 0);
+  ctx.restore();
+}
+
+function drawWeb(L, idx, W, H, P){
+  const I = cfg.I;
+  const pts = L.map(p => pt(p, W, H));
+  const vis = i => L[i].v > .3;
+  if (!(vis(11) && vis(12))) return;
+  const torso = [11,12,23,24].filter(vis);
+  const c = torso.reduce((s, i) => [s[0] + pts[i][0] / torso.length, s[1] + pts[i][1] / torso.length], [0, 0]);
+  const ring = KEY.filter(vis).map(i => pts[i]).sort((a, b) => Math.atan2(a[1]-c[1], a[0]-c[0]) - Math.atan2(b[1]-c[1], b[0]-c[0]));
+  const n = ring.length;
+  ctx.save();
+  ctx.lineCap = 'round';
+  // bones
+  for (const [a, b] of BONES) if (vis(a) && vis(b))
+    glow(P, 2.2 + 2 * I, .75, () => { ctx.moveTo(...pts[a]); ctx.lineTo(...pts[b]); });
+  if (n >= 4){
+    // radial strands
+    for (const p of ring) glow(P, 1.1, .35 + .4 * I, () => { ctx.moveTo(...c); ctx.lineTo(...p); });
+    // sagging rings
+    for (const s of [.3, .55, .8, 1]){
+      for (let i = 0; i < n; i++){
+        const p = ring[i], q = ring[(i + 1) % n];
+        const a = [c[0] + (p[0]-c[0]) * s, c[1] + (p[1]-c[1]) * s];
+        const b = [c[0] + (q[0]-c[0]) * s, c[1] + (q[1]-c[1]) * s];
+        const m = [(a[0]+b[0])/2, (a[1]+b[1])/2];
+        const k = [m[0] + (c[0]-m[0]) * .2, m[1] + (c[1]-m[1]) * .2];
+        glow(P, 1, .3 + .4 * I, () => { ctx.moveTo(...a); ctx.quadraticCurveTo(...k, ...b); });
+      }
+    }
+  }
+  // mini webs on hands
+  for (const [w, e] of [[15, 13], [16, 14]]){
+    if (!(vis(w) && vis(e))) continue;
+    const o = pts[w], R = Math.max(30, Math.hypot(o[0]-pts[e][0], o[1]-pts[e][1]) * .9);
+    for (let k = 0; k < 10; k++){
+      const ang = k / 10 * Math.PI * 2;
+      glow(P, 1, .45 + .3 * I, () => { ctx.moveTo(...o); ctx.lineTo(o[0] + Math.cos(ang) * R, o[1] + Math.sin(ang) * R); });
+    }
+    for (const s of [.35, .65, 1]){
+      for (let k = 0; k < 10; k++){
+        const a1 = k / 10 * Math.PI * 2, a2 = (k + 1) / 10 * Math.PI * 2, am = (a1 + a2) / 2;
+        glow(P, 1, .4 + .3 * I, () => {
+          ctx.moveTo(o[0] + Math.cos(a1) * R * s, o[1] + Math.sin(a1) * R * s);
+          ctx.quadraticCurveTo(o[0] + Math.cos(am) * R * s * .82, o[1] + Math.sin(am) * R * s * .82,
+                               o[0] + Math.cos(a2) * R * s, o[1] + Math.sin(a2) * R * s);
+        });
+      }
+    }
+  }
+  // joint beads
+  ctx.shadowBlur = 14; ctx.fillStyle = P.c;
+  for (const i of KEY) if (vis(i)){ ctx.globalAlpha = .9; ctx.beginPath(); ctx.arc(pts[i][0], pts[i][1], 3 + 2 * I, 0, 7); ctx.fill(); }
+  ctx.restore();
+
+  // trails + drops
+  const tr = trails[idx] || (trails[idx] = {15:[], 16:[]});
+  for (const w of [15, 16]){
+    if (!vis(w)) { tr[w].length = 0; continue; }
+    const h = tr[w]; h.unshift(pts[w]); if (h.length > 16) h.pop();
+    if (cfg.trail && h.length > 3){
+      ctx.save(); ctx.lineCap = 'round';
+      for (let k = 2; k < h.length; k += 2)
+        glow(P, 1.1, (1 - k / h.length) * .55 * (.4 + I), () => { ctx.moveTo(...h[0]); ctx.quadraticCurveTo((h[0][0]+h[k][0])/2, (h[0][1]+h[k][1])/2 + 14, ...h[k]); });
+      ctx.restore();
+    }
+    const sp = h.length > 1 ? Math.hypot(h[0][0]-h[1][0], h[0][1]-h[1][1]) : 0;
+    if (cfg.drops && sp > 12 && Math.random() < .6) spawnDrop(pts[w]);
+  }
+  if (cfg.drops && Math.random() < .25 * I){
+    const k = KEY.filter(vis); const p = pts[k[Math.random() * k.length | 0]];
+    spawnDrop(p);
+  }
+}
+
+function spawnDrop(p){
+  if (drops.length > 120) return;
+  drops.push({x:p[0] + (Math.random() - .5) * 12, y:p[1], vy:Math.random() * 1.5, r:2 + Math.random() * 3.5, life:1});
+}
+function drawDrops(P){
+  ctx.save();
+  for (const d of drops){
+    d.vy += .35; d.y += d.vy; d.life -= .012;
+    ctx.globalAlpha = Math.max(0, d.life);
+    const g = ctx.createRadialGradient(d.x - d.r*.3, d.y - d.r*.3, 0, d.x, d.y, d.r * 1.4);
+    g.addColorStop(0, '#fff'); g.addColorStop(.5, P.a); g.addColorStop(1, P.b);
+    ctx.fillStyle = g; ctx.shadowColor = P.b; ctx.shadowBlur = 8;
+    ctx.beginPath(); ctx.ellipse(d.x, d.y, d.r * .8, d.r * 1.3, 0, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+  drops = drops.filter(d => d.life > 0 && d.y < cv.height + 20);
+}
+
+function render(){
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const s = Math.min(1, 1280 / Math.max(vw, vh));
+  const W = Math.round(vw * s), H = Math.round(vh * s);
+  if (cv.width !== W || cv.height !== H){ cv.width = W; cv.height = H; }
+  const P = PAL[cfg.pal];
+  ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha = 1; ctx.shadowBlur = 0; ctx.globalCompositeOperation = 'source-over';
+  ctx.save(); if (mirror){ ctx.translate(W, 0); ctx.scale(-1, 1); }
+  ctx.drawImage(video, 0, 0, W, H); ctx.restore();
+  if (cfg.glass && hasMask) drawIce(W, H, P);
+  if (cfg.web) people.forEach((L, i) => drawWeb(L, i, W, H, P));
+  if (cfg.drops) drawDrops(P);
+  ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+}
+
+function frame(){
+  requestAnimationFrame(frame);
+  if (!video.videoWidth || video.readyState < 2) return;
+  if (landmarker && !video.paused){
+    let ts = performance.now(); if (ts <= lastTs) ts = lastTs + 1; lastTs = ts;
+    try{ landmarker.detectForVideo(video, ts, onResult); }catch(e){}
+    if ($('status').textContent !== 'Tracking') status('Tracking');
+  }
+  render();
+}
+requestAnimationFrame(frame);
+
+/* ---------- Recording / saving ---------- */
+let rec = null, chunks = [];
+function download(blob, name){
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+function toggleRec(){
+  const btn = $('rec');
+  if (rec && rec.state === 'recording'){ rec.stop(); return; }
+  if (!window.MediaRecorder){ alert('Recording is not supported in this browser. Try Chrome, Edge, or Safari 14.1+.'); return; }
+  const out = cv.captureStream(30);
+  try{ const vs = video.captureStream && video.captureStream(); if (vs) vs.getAudioTracks().forEach(tr => out.addTrack(tr)); }catch(e){}
+  const mime = ['video/mp4;codecs=avc1','video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'].find(m => MediaRecorder.isTypeSupported(m));
+  rec = new MediaRecorder(out, mime ? {mimeType:mime, videoBitsPerSecond:8e6} : {});
+  chunks = [];
+  rec.ondataavailable = e => e.data.size && chunks.push(e.data);
+  rec.onstop = () => {
+    btn.classList.remove('on'); btn.textContent = '● Record';
+    const type = rec.mimeType || 'video/webm';
+    const blob = new Blob(chunks, {type});
+    const ext = type.includes('mp4') ? 'mp4' : 'webm';
+    const url = URL.createObjectURL(blob);
+    $('result').innerHTML = `<a href="${url}" download="ice-web.${ext}">Save video</a>`;
+  };
+  $('result').innerHTML = '';
+  rec.start(); btn.classList.add('on'); btn.textContent = '■ Stop';
+}
+</script>
+</body>
+</html>
